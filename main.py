@@ -213,6 +213,7 @@ def parse_arguments() -> argparse.Namespace:
   python main.py --dry-run          # 仅获取数据，不进行 AI 分析
   python main.py --stocks 600519,000001  # 指定分析特定股票
   python main.py --no-notify        # 不发送推送通知
+  python main.py --check-notify     # 检查通知配置，不发送通知
   python main.py --single-notify    # 启用单股推送模式（每分析完一只立即推送）
   python main.py --schedule         # 启用定时任务模式
   python main.py --market-review    # 仅运行大盘复盘
@@ -241,6 +242,12 @@ def parse_arguments() -> argparse.Namespace:
         '--no-notify',
         action='store_true',
         help='不发送推送通知'
+    )
+
+    parser.add_argument(
+        '--check-notify',
+        action='store_true',
+        help='只读检查通知渠道配置，不发送通知'
     )
 
     parser.add_argument(
@@ -514,7 +521,7 @@ def run_full_analysis(
             if parts:
                 combined_content = "\n\n---\n\n".join(parts)
                 if pipeline.notifier.is_available():
-                    if pipeline.notifier.send(combined_content, email_send_to_all=True):
+                    if pipeline.notifier.send(combined_content, email_send_to_all=True, route_type="report"):
                         logger.info("已合并推送（个股+大盘复盘）")
                     else:
                         logger.warning("合并推送失败")
@@ -565,7 +572,10 @@ def run_full_analysis(
                     logger.info(f"飞书云文档创建成功: {doc_url}")
                     # 可选：将文档链接也推送到群里
                     if not args.no_notify:
-                        pipeline.notifier.send(f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}")
+                        pipeline.notifier.send(
+                            f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}",
+                            route_type="report",
+                        )
 
         except Exception as e:
             logger.error(f"飞书文档生成失败: {e}")
@@ -747,6 +757,16 @@ def main() -> int:
     warnings = config.validate()
     for warning in warnings:
         logger.warning(warning)
+
+    if getattr(args, "check_notify", False):
+        from src.services.notification_diagnostics import (
+            format_notification_diagnostics,
+            run_notification_diagnostics,
+        )
+
+        result = run_notification_diagnostics(config)
+        print(format_notification_diagnostics(result))
+        return 0 if result.ok else 1
 
     # 解析股票列表（统一为大写 Issue #355）
     stock_codes = None
