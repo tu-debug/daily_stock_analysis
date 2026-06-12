@@ -3,19 +3,28 @@
 
 import logging
 import os
+import socket
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from tests.litellm_stub import ensure_litellm_stub
 
 ensure_litellm_stub()
 
+_ENV_BEFORE_MAIN_IMPORT = dict(os.environ)
 import main
 from src.config import Config
+
+_MAIN_IMPORT_ENV_ADDITIONS = frozenset(set(os.environ) - set(_ENV_BEFORE_MAIN_IMPORT))
+_MAIN_IMPORT_ENV_OVERRIDES = {
+    key: value
+    for key, value in _ENV_BEFORE_MAIN_IMPORT.items()
+    if os.environ.get(key) != value
+}
 
 
 class _DummyConfig(SimpleNamespace):
@@ -51,6 +60,10 @@ class MainScheduleModeTestCase(unittest.TestCase):
         os.chdir(self.original_cwd)
         Config.reset_instance()
         self.env_patch.stop()
+        for key in _MAIN_IMPORT_ENV_ADDITIONS:
+            os.environ.pop(key, None)
+        for key, value in _MAIN_IMPORT_ENV_OVERRIDES.items():
+            os.environ[key] = value
         self.temp_dir.cleanup()
 
     def _make_args(self, **overrides):
@@ -89,9 +102,47 @@ class MainScheduleModeTestCase(unittest.TestCase):
             "schedule_time": "18:00",
             "schedule_run_immediately": True,
             "run_immediately": True,
+            "agent_event_monitor_enabled": False,
+            "agent_event_alert_rules_json": "",
+            "agent_event_monitor_interval_minutes": 5,
         }
         defaults.update(overrides)
         return _DummyConfig(**defaults)
+
+    def test_public_webui_bind_warns_when_auth_is_disabled(self) -> None:
+        with patch("src.auth.is_auth_enabled", return_value=False), \
+             patch("main.logger.warning") as warning_log:
+            main._warn_if_public_webui_without_auth("0.0.0.0")
+
+        warning_log.assert_called_once()
+        self.assertIn("WEBUI_HOST=%s", warning_log.call_args.args[0])
+        self.assertEqual(warning_log.call_args.args[1], "0.0.0.0")
+
+    def test_loopback_webui_bind_does_not_warn_when_auth_is_disabled(self) -> None:
+        with patch("src.auth.is_auth_enabled", return_value=False), \
+             patch("main.logger.warning") as warning_log:
+            main._warn_if_public_webui_without_auth("127.0.0.1")
+
+        warning_log.assert_not_called()
+
+    def test_start_api_server_fails_before_thread_when_port_is_busy(self) -> None:
+        config = self._make_config(log_level="INFO")
+
+        class BusySocket:
+            def bind(self, address):
+                raise OSError("address already in use")
+
+            def close(self):
+                pass
+
+        with patch("socket.socket", return_value=BusySocket()) as socket_factory, \
+             patch("threading.Thread") as thread_cls:
+            with self.assertRaises(RuntimeError) as caught:
+                main.start_api_server("127.0.0.1", 8000, config)
+
+        socket_factory.assert_called_once_with(socket.AF_INET, socket.SOCK_STREAM)
+        self.assertIn("127.0.0.1:8000", str(caught.exception))
+        thread_cls.assert_not_called()
 
     def test_schedule_mode_ignores_cli_stock_snapshot(self) -> None:
         args = self._make_args(schedule=True, stocks="600519,000001")
@@ -173,6 +224,96 @@ class MainScheduleModeTestCase(unittest.TestCase):
         )
         run_full_analysis.assert_called_once_with(runtime_config, args, None)
 
+    def test_schedule_mode_registers_event_monitor_background_task(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            schedule_enabled=False,
+            agent_event_monitor_enabled=True,
+            agent_event_monitor_interval_minutes=7,
+        )
+        worker = MagicMock()
+        worker.run_once.return_value = {"triggered": 2}
+        scheduled_call = {}
+
+        def fake_run_with_schedule(
+            task,
+            schedule_time,
+            run_immediately,
+            background_tasks=None,
+            schedule_time_provider=None,
+        ):
+            scheduled_call["schedule_time"] = schedule_time
+            scheduled_call["run_immediately"] = run_immediately
+            scheduled_call["background_tasks"] = background_tasks or []
+            scheduled_call["resolved_schedule_time"] = (
+                schedule_time_provider() if schedule_time_provider is not None else None
+            )
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config) as reload_config, \
+             patch("main._build_schedule_time_provider", return_value=lambda: "18:00"), \
+             patch("main.setup_logging"), \
+             patch("main.run_full_analysis") as run_full_analysis, \
+             patch("src.services.alert_worker.AlertWorker", return_value=worker) as worker_cls, \
+             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        worker_cls.assert_called_once()
+        self.assertIs(worker_cls.call_args.kwargs["config_provider"], reload_config)
+        run_full_analysis.assert_not_called()
+        self.assertEqual(scheduled_call["schedule_time"], "18:00")
+        self.assertEqual(scheduled_call["run_immediately"], True)
+        self.assertEqual(scheduled_call["resolved_schedule_time"], "18:00")
+        self.assertEqual(len(scheduled_call["background_tasks"]), 1)
+        background_task = scheduled_call["background_tasks"][0]
+        self.assertEqual(background_task["name"], "agent_event_monitor")
+        self.assertEqual(background_task["interval_seconds"], 7 * 60)
+        self.assertEqual(background_task["run_immediately"], True)
+
+        with patch("main.logger.info") as info_log:
+            background_task["task"]()
+
+        worker.run_once.assert_called_once_with()
+        info_log.assert_any_call("[EventMonitor] 本轮触发 %d 条提醒", 2)
+
+    def test_schedule_mode_registers_event_monitor_worker_without_legacy_rules(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            schedule_enabled=False,
+            agent_event_monitor_enabled=True,
+            agent_event_alert_rules_json="",
+        )
+        worker = MagicMock()
+        worker.run_once.return_value = {"triggered": 0}
+        scheduled_call = {}
+
+        def fake_run_with_schedule(
+            task,
+            schedule_time,
+            run_immediately,
+            background_tasks=None,
+            schedule_time_provider=None,
+        ):
+            scheduled_call["background_tasks"] = background_tasks or []
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config), \
+             patch("main._build_schedule_time_provider", return_value=lambda: "18:00"), \
+             patch("main.setup_logging"), \
+             patch("main.run_full_analysis") as run_full_analysis, \
+             patch("src.services.alert_worker.AlertWorker", return_value=worker) as worker_cls, \
+             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        worker_cls.assert_called_once()
+        run_full_analysis.assert_not_called()
+        self.assertEqual(len(scheduled_call["background_tasks"]), 1)
+        self.assertEqual(scheduled_call["background_tasks"][0]["name"], "agent_event_monitor")
+
     def test_check_notify_returns_before_other_modes(self) -> None:
         args = self._make_args(check_notify=True, serve=True, schedule=True, market_review=True)
         config = self._make_config(webui_enabled=False)
@@ -199,6 +340,99 @@ class MainScheduleModeTestCase(unittest.TestCase):
         print_output.assert_called_once_with("通知配置诊断")
         start_api_server.assert_not_called()
         run_full_analysis.assert_not_called()
+
+    def test_serve_mode_exits_when_api_server_start_fails(self) -> None:
+        args = self._make_args(serve_only=True, host="127.0.0.1", port=8000)
+        config = self._make_config(webui_enabled=False)
+
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}, clear=False), \
+             patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main.prepare_webui_frontend_assets", return_value=True), \
+             patch("main.start_api_server", side_effect=RuntimeError("port busy")), \
+             patch("main.start_bot_stream_clients") as start_bots, \
+             patch("main.logger.error") as error_log:
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 1)
+        start_bots.assert_not_called()
+        error_log.assert_called_once()
+
+    def test_webui_only_maps_to_serve_only_and_exits_when_api_server_start_fails(self) -> None:
+        args = self._make_args(webui_only=True, host="127.0.0.1", port=8000)
+        config = self._make_config(webui_enabled=False)
+
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}, clear=False), \
+             patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main.prepare_webui_frontend_assets", return_value=True), \
+             patch("main.start_api_server", side_effect=RuntimeError("port busy")), \
+             patch("main.start_bot_stream_clients") as start_bots, \
+             patch("main.run_full_analysis") as run_full_analysis, \
+             patch("main.logger.error") as error_log:
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 1)
+        start_bots.assert_not_called()
+        run_full_analysis.assert_not_called()
+        error_log.assert_called_once()
+
+    def test_serve_mode_continues_single_analysis_when_api_server_start_fails(self) -> None:
+        args = self._make_args(serve=True, host="127.0.0.1", port=8000)
+        config = self._make_config(webui_enabled=False, run_immediately=True)
+
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}, clear=False), \
+             patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main.prepare_webui_frontend_assets", return_value=True), \
+             patch("main.start_api_server", side_effect=RuntimeError("port busy")), \
+             patch("main.start_bot_stream_clients") as start_bots, \
+             patch("main.run_full_analysis") as run_full_analysis, \
+             patch("main.logger.error") as error_log:
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        start_bots.assert_not_called()
+        run_full_analysis.assert_called_once_with(config, args, None)
+        error_log.assert_called_once()
+
+    def test_serve_schedule_mode_continues_scheduler_when_api_server_start_fails(self) -> None:
+        args = self._make_args(serve=True, schedule=True, host="127.0.0.1", port=8000)
+        config = self._make_config(webui_enabled=False, schedule_enabled=False)
+        scheduled_call = {}
+
+        def fake_run_with_schedule(
+            task,
+            schedule_time,
+            run_immediately,
+            background_tasks=None,
+            schedule_time_provider=None,
+        ):
+            scheduled_call["schedule_time"] = schedule_time
+            scheduled_call["run_immediately"] = run_immediately
+            scheduled_call["background_tasks"] = background_tasks or []
+            task()
+
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}, clear=False), \
+             patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config), \
+             patch("main._build_schedule_time_provider", return_value=lambda: "18:00"), \
+             patch("main.prepare_webui_frontend_assets", return_value=True), \
+             patch("main.start_api_server", side_effect=RuntimeError("port busy")), \
+             patch("main.start_bot_stream_clients") as start_bots, \
+             patch("main.run_full_analysis") as run_full_analysis, \
+             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule), \
+             patch("main.logger.error") as error_log:
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        start_bots.assert_not_called()
+        run_full_analysis.assert_called_once_with(config, args, None)
+        self.assertEqual(scheduled_call["schedule_time"], "18:00")
+        self.assertEqual(scheduled_call["run_immediately"], True)
+        self.assertEqual(scheduled_call["background_tasks"], [])
+        error_log.assert_called_once()
 
     def test_reload_runtime_config_preserves_process_env_overrides(self) -> None:
         self.env_path.write_text(
@@ -371,6 +605,119 @@ class MainScheduleModeTestCase(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         run_full_analysis.assert_called_once_with(config, args, ["600519", "000001"])
 
+    def test_run_full_analysis_skips_market_review_when_shared_lock_is_held(self) -> None:
+        from src.core.market_review_lock import (
+            release_market_review_lock,
+            try_acquire_market_review_lock,
+        )
+
+        args = self._make_args()
+        config = self._make_config(
+            trading_day_check_enabled=False,
+            market_review_enabled=True,
+            no_market_review=False,
+            single_stock_notify=False,
+            merge_email_notification=False,
+            analysis_delay=0,
+            database_path=str(Path(self.temp_dir.name) / "stock_analysis.db"),
+        )
+        pipeline = MagicMock()
+        pipeline.run.return_value = []
+        events = []
+
+        def refresh_index(config_arg):
+            events.append("refresh")
+
+        def build_pipeline(*args, **kwargs):
+            events.append("pipeline")
+            return pipeline
+
+        lock_token = try_acquire_market_review_lock(config)
+        self.assertIsNotNone(lock_token)
+        try:
+            with patch.object(main, "_refresh_stock_index_cache_for_analysis", side_effect=refresh_index) as refresh, \
+                 patch("src.core.pipeline.StockAnalysisPipeline", side_effect=build_pipeline), \
+                 patch("src.core.market_review.run_market_review") as run_market_review:
+                main.run_full_analysis(config, args, [])
+        finally:
+            release_market_review_lock(lock_token)
+
+        refresh.assert_called_once_with(config)
+        self.assertEqual(events[:2], ["refresh", "pipeline"])
+        pipeline.run.assert_called_once()
+        run_market_review.assert_not_called()
+
+    def test_config_enabled_schedule_marks_market_review_source_as_schedule(self) -> None:
+        args = self._make_args(schedule=False)
+        config = self._make_config(
+            schedule_enabled=True,
+            trading_day_check_enabled=False,
+            market_review_enabled=True,
+            no_market_review=False,
+            single_stock_notify=False,
+            merge_email_notification=False,
+            analysis_delay=0,
+            database_path=str(Path(self.temp_dir.name) / "stock_analysis.db"),
+        )
+        pipeline = MagicMock()
+        pipeline.run.return_value = []
+
+        with patch.object(main, "_refresh_stock_index_cache_for_analysis"), \
+             patch.object(main, "_compute_trading_day_filter", return_value=(["600519"], "cn", False)), \
+             patch("src.core.pipeline.StockAnalysisPipeline", return_value=pipeline), \
+             patch("main._run_market_review_with_shared_lock", return_value="market report") as run_with_lock, \
+             patch("src.core.market_review.run_market_review") as run_market_review:
+            main.run_full_analysis(config, args, ["600519"])
+
+        pipeline.run.assert_called_once()
+        run_with_lock.assert_called_once()
+        call_args = run_with_lock.call_args
+        self.assertIs(call_args.args[1], run_market_review)
+        self.assertEqual(call_args.kwargs["trigger_source"], "schedule")
+
+    def test_market_review_mode_uses_shared_runtime_assembly(self) -> None:
+        args = self._make_args(market_review=True)
+        config = self._make_config(
+            trading_day_check_enabled=True,
+            market_review_region="both",
+            market_review_enabled=False,
+            database_path=str(Path(self.temp_dir.name) / "stock_analysis.db"),
+        )
+        runtime_notifier = MagicMock()
+        runtime_analyzer = MagicMock()
+        runtime_search_service = MagicMock()
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main.setup_logging"), \
+             patch("main._run_market_review_with_shared_lock") as run_with_lock, \
+             patch(
+                 "src.core.market_review_runtime.build_market_review_runtime",
+                 return_value=(
+                    runtime_notifier,
+                    runtime_analyzer,
+                    runtime_search_service,
+                 ),
+             ) as runtime_builder, \
+             patch("src.core.market_review.run_market_review") as run_market_review, \
+             patch("src.core.trading_calendar.get_open_markets_today", return_value={"cn", "us"}), \
+             patch("src.core.trading_calendar.compute_effective_region", return_value="cn,us"):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        runtime_builder.assert_called_once_with(config)
+        run_with_lock.assert_called_once()
+        call_args = run_with_lock.call_args
+        self.assertEqual(call_args.args[0], config)
+        self.assertIs(call_args.args[1], run_market_review)
+        self.assertIs(call_args.kwargs["notifier"], runtime_notifier)
+        self.assertIs(call_args.kwargs["analyzer"], runtime_analyzer)
+        self.assertIs(call_args.kwargs["search_service"], runtime_search_service)
+        self.assertTrue(call_args.kwargs["send_notification"])
+        self.assertNotIn("merge_notification", call_args.kwargs)
+        self.assertEqual(call_args.kwargs["override_region"], "cn,us")
+        self.assertEqual(call_args.kwargs["trigger_source"], "cli")
+
     def test_bootstrap_logging_persists_when_config_load_fails(self) -> None:
         """Config load failure must be logged to stderr and return exit code 1.
 
@@ -417,6 +764,40 @@ class MainScheduleModeTestCase(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         run_mock.assert_called_once()
+
+    def test_runtime_file_logging_permission_error_falls_back_to_console(self) -> None:
+        """Configured file logging failures should not prevent Docker startup."""
+        import io
+
+        args = self._make_args()
+        config = self._make_config(log_dir="/app/logs")
+        capture_stream = io.StringIO()
+        capture_handler = logging.StreamHandler(capture_stream)
+        capture_handler.setLevel(logging.DEBUG)
+        capture_handler.setFormatter(logging.Formatter("%(message)s"))
+
+        root_logger = logging.getLogger()
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch(
+                 "main.setup_logging",
+                 side_effect=PermissionError("/app/logs/stock_analysis_20260511.log"),
+             ), \
+             patch("main.run_full_analysis") as run_mock:
+            root_logger.addHandler(capture_handler)
+            try:
+                exit_code = main.main()
+            finally:
+                root_logger.removeHandler(capture_handler)
+                capture_handler.close()
+
+        self.assertEqual(exit_code, 0)
+        run_mock.assert_called_once()
+        output = capture_stream.getvalue()
+        self.assertIn("文件日志初始化失败，已降级为控制台日志输出", output)
+        self.assertIn("/app/logs", output)
+        self.assertIn("官方 Docker 镜像启动入口会自动修复默认挂载目录权限", output)
 
     def test_run_full_analysis_import_failure_propagates(self) -> None:
         """P1: import failures in run_full_analysis must propagate, not be swallowed."""

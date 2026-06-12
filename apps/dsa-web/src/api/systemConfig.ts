@@ -6,6 +6,7 @@ import type {
   DiscoverLLMChannelModelsResponse,
   ExportSystemConfigResponse,
   ImportSystemConfigRequest,
+  SetupStatusResponse,
   SystemConfigConflictResponse,
   SystemConfigResponse,
   SystemConfigSchemaResponse,
@@ -134,14 +135,23 @@ export const systemConfigApi = {
     return toCamelCase<SystemConfigResponse>(response.data);
   },
 
-  async exportDesktopEnv(): Promise<ExportSystemConfigResponse> {
+  async exportEnv(): Promise<ExportSystemConfigResponse> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/system/config/export');
     return toCamelCase<ExportSystemConfigResponse>(response.data);
+  },
+
+  async exportDesktopEnv(): Promise<ExportSystemConfigResponse> {
+    return this.exportEnv();
   },
 
   async getSchema(): Promise<SystemConfigSchemaResponse> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/system/config/schema');
     return toCamelCase<SystemConfigSchemaResponse>(response.data);
+  },
+
+  async getSetupStatus(): Promise<SetupStatusResponse> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/system/config/setup/status');
+    return toCamelCase<SetupStatusResponse>(response.data);
   },
 
   async validate(payload: ValidateSystemConfigRequest): Promise<ValidateSystemConfigResponse> {
@@ -152,12 +162,16 @@ export const systemConfigApi = {
     return toCamelCase<ValidateSystemConfigResponse>(response.data);
   },
 
-  async importDesktopEnv(payload: ImportSystemConfigRequest): Promise<UpdateSystemConfigResponse> {
+  async importEnv(payload: ImportSystemConfigRequest): Promise<UpdateSystemConfigResponse> {
     const response = await apiClient.post<Record<string, unknown>>(
       '/api/v1/system/config/import',
       toSnakeImportPayload(payload),
     );
     return toCamelCase<UpdateSystemConfigResponse>(response.data);
+  },
+
+  async importDesktopEnv(payload: ImportSystemConfigRequest): Promise<UpdateSystemConfigResponse> {
+    return this.importEnv(payload);
   },
 
   async testLLMChannel(payload: TestLLMChannelRequest): Promise<TestLLMChannelResponse> {
@@ -220,5 +234,36 @@ export const systemConfigApi = {
 
       throw error;
     }
+  },
+
+  /**
+   * 获取自选队列股票代码列表
+   */
+  getWatchlist: async (): Promise<string[]> => {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/stocks/watchlist');
+    const data = toCamelCase<{ stockCodes: string[] }>(response.data);
+    return data.stockCodes || [];
+  },
+
+  /**
+   * 添加股票到自选队列
+   */
+  addToWatchlist: async (stockCode: string): Promise<string[]> => {
+    const response = await apiClient.post<Record<string, unknown>>('/api/v1/stocks/watchlist/add', {
+      stock_code: stockCode,
+    });
+    const data = toCamelCase<{ stockCodes: string[] }>(response.data);
+    return data.stockCodes || [];
+  },
+
+  /**
+   * 从自选队列移除股票
+   */
+  removeFromWatchlist: async (stockCode: string): Promise<string[]> => {
+    const response = await apiClient.post<Record<string, unknown>>('/api/v1/stocks/watchlist/remove', {
+      stock_code: stockCode,
+    });
+    const data = toCamelCase<{ stockCodes: string[] }>(response.data);
+    return data.stockCodes || [];
   },
 };

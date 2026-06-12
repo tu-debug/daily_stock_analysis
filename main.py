@@ -21,9 +21,12 @@ A股自选股智能分析系统 - 主调度程序
 - 效率优先：关注筹码集中度好的股票
 - 买点偏好：缩量回踩 MA5/MA10 支撑
 """
+from __future__ import annotations
+
+import multiprocessing
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from dotenv import dotenv_values
 from src.config import setup_env
@@ -41,13 +44,25 @@ if os.getenv("GITHUB_ACTIONS") != "true" and os.getenv("USE_PROXY", "false").low
     os.environ["http_proxy"] = proxy_url
     os.environ["https_proxy"] = proxy_url
 
+if os.getenv("DSA_PACKAGED_ALPHASIFT_IMPORT_PROBE") == "1":
+    import importlib
+    import sys
+
+    try:
+        importlib.import_module("alphasift.dsa_adapter")
+    except Exception as exc:
+        print(f"ERROR: packaged AlphaSift adapter import failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print("OK: packaged AlphaSift adapter import succeeded")
+    sys.exit(0)
+
 import argparse
 import logging
 import sys
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import List, Tuple
 
 from data_provider.base import canonical_stock_code
 from src.webui_frontend import prepare_webui_frontend_assets
@@ -57,6 +72,7 @@ from src.logging_config import setup_logging
 
 logger = logging.getLogger(__name__)
 _RUNTIME_ENV_FILE_KEYS = set()
+_PUBLIC_BIND_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*"})
 
 
 def _get_active_env_path() -> Path:
@@ -64,6 +80,26 @@ def _get_active_env_path() -> Path:
     if env_file:
         return Path(env_file)
     return Path(__file__).resolve().parent / ".env"
+
+
+def _is_public_bind_host(host: str) -> bool:
+    return (host or "").strip().lower() in _PUBLIC_BIND_HOSTS
+
+
+def _warn_if_public_webui_without_auth(host: str) -> None:
+    if not _is_public_bind_host(host):
+        return
+
+    from src.auth import is_auth_enabled
+
+    if is_auth_enabled():
+        return
+    logger.warning(
+        "WEBUI_HOST=%s binds the Web UI to a public interface while "
+        "ADMIN_AUTH_ENABLED=false. Keep this service behind a trusted network "
+        "boundary or enable admin authentication before exposing it.",
+        host,
+    )
 
 
 def _read_active_env_values() -> Optional[Dict[str, str]]:
@@ -138,6 +174,22 @@ def _setup_bootstrap_logging(debug: bool = False) -> None:
             logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
         )
         root.addHandler(handler)
+
+
+def _setup_runtime_logging(log_dir: str, debug: bool = False) -> bool:
+    """Switch to configured logging, falling back to console on file I/O errors."""
+    try:
+        setup_logging(log_prefix="stock_analysis", debug=debug, log_dir=log_dir)
+        return True
+    except OSError as exc:
+        logger.warning(
+            "文件日志初始化失败，已降级为控制台日志输出；日志目录 %r 当前不可写或不可创建: %s。"
+            "官方 Docker 镜像启动入口会自动修复默认挂载目录权限；若仍失败，"
+            "请检查是否使用了 --user、只读挂载、rootless Docker 或 NFS 等限制写入的环境。",
+            log_dir,
+            exc,
+        )
+        return False
 
 
 def _get_stock_analysis_pipeline():
@@ -409,6 +461,44 @@ def _compute_trading_day_filter(
     return (filtered_codes, effective_region, should_skip_all)
 
 
+def _run_market_review_with_shared_lock(
+    config: Config,
+    run_market_review_func: Callable[..., Optional[str]],
+    **kwargs: Any,
+) -> Optional[str]:
+    from src.core.market_review_lock import (
+        release_market_review_lock,
+        try_acquire_market_review_lock,
+    )
+
+    lock_token = try_acquire_market_review_lock(config)
+    if lock_token is None:
+        logger.warning("大盘复盘正在执行中，跳过本次大盘复盘")
+        return None
+
+    try:
+        return run_market_review_func(**kwargs)
+    finally:
+        release_market_review_lock(lock_token)
+
+
+def _refresh_stock_index_cache_for_analysis(config: Config) -> None:
+    """Best-effort stock-index refresh for CLI/scheduled analysis paths."""
+    try:
+        from src.services.stock_index_remote_service import (
+            refresh_remote_stock_index_cache,
+            settings_from_config,
+        )
+
+        result = refresh_remote_stock_index_cache(settings_from_config(config))
+        if result.refreshed:
+            logger.info("[stock-index] 分析前已刷新股票索引缓存: %s", result.cache_path)
+        elif result.error:
+            logger.debug("[stock-index] 分析前刷新未完成，继续使用本地索引: %s", result.error)
+    except Exception as exc:  # noqa: BLE001 - stock index freshness must not block analysis.
+        logger.warning("[stock-index] 分析前刷新股票索引失败，继续执行分析: %s", exc)
+
+
 def run_full_analysis(
     config: Config,
     args: argparse.Namespace,
@@ -425,6 +515,8 @@ def run_full_analysis(
     from src.core.pipeline import StockAnalysisPipeline
 
     try:
+        _refresh_stock_index_cache_for_analysis(config)
+
         # Issue #529: Hot-reload STOCK_LIST from .env on each scheduled run
         if stock_codes is None:
             config.refresh_stock_list()
@@ -495,13 +587,21 @@ def run_full_analysis(
             and not args.no_market_review
             and effective_region != ''
         ):
-            review_result = run_market_review(
+            schedule_mode = bool(
+                getattr(args, 'schedule', False)
+                or getattr(config, 'schedule_enabled', False)
+            )
+            review_trigger_source = "schedule" if schedule_mode else "cli"
+            review_result = _run_market_review_with_shared_lock(
+                config,
+                run_market_review,
                 notifier=pipeline.notifier,
                 analyzer=pipeline.analyzer,
                 search_service=pipeline.search_service,
                 send_notification=not args.no_notify,
                 merge_notification=merge_notification,
                 override_region=effective_region,
+                trigger_source=review_trigger_source,
             )
             # 如果有结果，赋值给 market_report 用于后续飞书文档生成
             if review_result:
@@ -613,8 +713,17 @@ def start_api_server(host: str, port: int, config: Config) -> None:
         port: 监听端口
         config: 配置对象
     """
+    import socket
     import threading
     import uvicorn
+
+    probe = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((host, port))
+    except OSError as exc:
+        raise RuntimeError(f"FastAPI port is not available: {host}:{port}") from exc
+    finally:
+        probe.close()
 
     def run_server():
         level_name = (config.log_level or "INFO").lower()
@@ -743,7 +852,7 @@ def main() -> int:
 
     # 配置日志（输出到控制台和文件）
     try:
-        setup_logging(log_prefix="stock_analysis", debug=args.debug, log_dir=config.log_dir)
+        _setup_runtime_logging(config.log_dir, debug=args.debug)
     except Exception as exc:
         logger.exception("切换到配置日志目录失败: %s", exc)
         return 1
@@ -793,6 +902,7 @@ def main() -> int:
             args.host = os.getenv('WEBUI_HOST')
         if args.port == 8000 and os.getenv('WEBUI_PORT'):
             args.port = int(os.getenv('WEBUI_PORT'))
+        _warn_if_public_webui_without_auth(args.host)
 
     bot_clients_started = False
     if start_serve:
@@ -803,6 +913,9 @@ def main() -> int:
             bot_clients_started = True
         except Exception as e:
             logger.error(f"启动 FastAPI 服务失败: {e}")
+            if args.serve_only:
+                return 1
+            start_serve = False
 
     if bot_clients_started:
         start_bot_stream_clients(config)
@@ -841,10 +954,8 @@ def main() -> int:
 
         # 模式1: 仅大盘复盘
         if args.market_review:
-            from src.analyzer import GeminiAnalyzer
             from src.core.market_review import run_market_review
-            from src.notification import NotificationService
-            from src.search_service import SearchService
+            from src.core.market_review_runtime import build_market_review_runtime
 
             # Issue #373: Trading day check for market-review-only mode.
             # Do NOT use _compute_trading_day_filter here: that helper checks
@@ -862,40 +973,17 @@ def main() -> int:
                     return 0
 
             logger.info("模式: 仅大盘复盘")
-            notifier = NotificationService()
+            notifier, analyzer, search_service = build_market_review_runtime(config)
 
-            # 初始化搜索服务和分析器（如果有配置）
-            search_service = None
-            analyzer = None
-
-            if config.has_search_capability_enabled():
-                search_service = SearchService(
-                    bocha_keys=config.bocha_api_keys,
-                    tavily_keys=config.tavily_api_keys,
-                    anspire_keys=config.anspire_api_keys,
-                    brave_keys=config.brave_api_keys,
-                    serpapi_keys=config.serpapi_keys,
-                    minimax_keys=config.minimax_api_keys,
-                    searxng_base_urls=config.searxng_base_urls,
-                    searxng_public_instances_enabled=config.searxng_public_instances_enabled,
-                    news_max_age_days=config.news_max_age_days,
-                    news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
-                )
-
-            if config.gemini_api_key or config.openai_api_key:
-                analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
-                if not analyzer.is_available():
-                    logger.warning("AI 分析器初始化后不可用，请检查 API Key 配置")
-                    analyzer = None
-            else:
-                logger.warning("未检测到 API Key (Gemini/OpenAI)，将仅使用模板生成报告")
-
-            run_market_review(
+            _run_market_review_with_shared_lock(
+                config,
+                run_market_review,
                 notifier=notifier,
                 analyzer=analyzer,
                 search_service=search_service,
                 send_notification=not args.no_notify,
                 override_region=effective_region,
+                trigger_source="cli",
             )
             return 0
 
@@ -923,25 +1011,23 @@ def main() -> int:
 
             background_tasks = []
             if getattr(config, 'agent_event_monitor_enabled', False):
-                from src.agent.events import build_event_monitor_from_config, run_event_monitor_once
+                from src.services.alert_worker import AlertWorker
 
-                monitor = build_event_monitor_from_config(config)
-                if monitor is not None:
-                    interval_minutes = max(1, getattr(config, 'agent_event_monitor_interval_minutes', 5))
+                interval_minutes = max(1, getattr(config, 'agent_event_monitor_interval_minutes', 5))
+                alert_worker = AlertWorker(config_provider=_reload_runtime_config)
 
-                    def event_monitor_task():
-                        triggered = run_event_monitor_once(monitor)
-                        if triggered:
-                            logger.info("[EventMonitor] 本轮触发 %d 条提醒", len(triggered))
+                def event_monitor_task():
+                    stats = alert_worker.run_once()
+                    triggered_count = stats.get("triggered", 0)
+                    if triggered_count:
+                        logger.info("[EventMonitor] 本轮触发 %d 条提醒", triggered_count)
 
-                    background_tasks.append({
-                        "task": event_monitor_task,
-                        "interval_seconds": interval_minutes * 60,
-                        "run_immediately": True,
-                        "name": "agent_event_monitor",
-                    })
-                else:
-                    logger.info("EventMonitor 已启用，但未加载到有效规则，跳过后台提醒任务")
+                background_tasks.append({
+                    "task": event_monitor_task,
+                    "interval_seconds": interval_minutes * 60,
+                    "run_immediately": True,
+                    "name": "agent_event_monitor",
+                })
 
             run_with_schedule(
                 task=scheduled_task,
@@ -982,4 +1068,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     sys.exit(main())
